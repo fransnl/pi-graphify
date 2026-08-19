@@ -3,12 +3,6 @@ import { join, dirname } from "node:path";
 import type { GraphNode, GraphEdge } from "./types.js";
 import type { GraphStore } from "./graph-store.js";
 
-export interface MemoryStoreData {
-  version: string;
-  updatedAt: string;
-  items: GraphNode[];
-}
-
 export class MemoryEngine {
   private memoryFilePath: string;
 
@@ -16,15 +10,25 @@ export class MemoryEngine {
     this.memoryFilePath = join(workspaceRoot, ".pi", "knowledge", "memory", "memory.json");
   }
 
-  /**
-   * Evaluates user prompt and assistant output after each turn to extract memory candidates.
-   */
+  public saveMemories(nodes: GraphNode[]): void {
+    try {
+      mkdirSync(dirname(this.memoryFilePath), { recursive: true });
+      const memoryNodes = nodes.filter((n) => ["constraint", "decision", "plan", "fact"].includes(n.kind));
+      writeFileSync(
+        this.memoryFilePath,
+        JSON.stringify({ version: "1.0.0", updatedAt: new Date().toISOString(), items: memoryNodes }, null, 2),
+        "utf-8"
+      );
+    } catch (err) {
+      console.error("[pi-graphify] Failed to save memory:", err);
+    }
+  }
+
   public extractTurnMemories(userPrompt: string, assistantResponse: string): { nodes: GraphNode[]; edges: GraphEdge[] } {
     const nodes: GraphNode[] = [];
     const edges: GraphEdge[] = [];
     const now = new Date().toISOString();
 
-    // 1. Detect User Directives & Constraints (Tier 1)
     const constraintMatches = userPrompt.match(/(?:always|never|do not|from now on|remember that|make sure to)\s+([^.!?\n]+)/gi);
     if (constraintMatches) {
       for (const match of constraintMatches) {
@@ -47,7 +51,6 @@ export class MemoryEngine {
       }
     }
 
-    // 2. Detect Architectural Decisions (Tier 2)
     const decisionMatches = assistantResponse.match(/(?:we decided to|chosen|refactored|architecture decision|using)\s+([^.!?\n]{15,100})/gi);
     if (decisionMatches && decisionMatches.length > 0) {
       const text = decisionMatches[0].trim();
@@ -71,16 +74,12 @@ export class MemoryEngine {
     return { nodes, edges };
   }
 
-  /**
-   * Applies stateful supersession for Tier 2 decisions.
-   */
   public handleSupersession(newDecision: GraphNode, store: GraphStore): void {
     const existingDecisions = store.nodes.filter(
       (n) => n.kind === "decision" && !n.supersededBy && n.id !== newDecision.id
     );
 
     for (const old of existingDecisions) {
-      // If new decision covers identical subject, supersede the old one
       const oldWords = new Set(old.name.toLowerCase().split(/\s+/));
       const newWords = newDecision.name.toLowerCase().split(/\s+/);
       const overlap = newWords.filter((w) => w.length > 3 && oldWords.has(w)).length;
@@ -103,9 +102,6 @@ export class MemoryEngine {
     }
   }
 
-  /**
-   * Decays and prunes stale Tier 3 ephemeral memories.
-   */
   public decayEphemeralMemories(store: GraphStore): number {
     const now = Date.now();
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -129,6 +125,7 @@ export class MemoryEngine {
         nodes: remainingNodes,
         edges: store.edges.filter((e) => remainingNodes.some((n) => n.id === e.source) && remainingNodes.some((n) => n.id === e.target)),
       });
+      this.saveMemories(remainingNodes);
     }
 
     return pruned;

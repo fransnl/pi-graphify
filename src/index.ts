@@ -2,13 +2,13 @@ import { join, resolve } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import type { GraphNode } from "./types.js";
 import { GraphStore } from "./graph-store.js";
 import { scanCodebase } from "./code-scanner.js";
 import { ingestTarget } from "./doc-ingester.js";
 import { generateArtifacts } from "./report-generator.js";
 import { MemoryEngine } from "./memory-engine.js";
 import { getAssociativePrimedContext } from "./associative-primer.js";
-import type { GraphNode } from "./types.js";
 
 export default function (pi: ExtensionAPI) {
   let store: GraphStore | null = null;
@@ -24,18 +24,16 @@ export default function (pi: ExtensionAPI) {
     return { store, memory: memoryEngine };
   }
 
-  // Session Initialization
+  // Session Start
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
     const { store: currentStore, memory } = getOrInitStore(ctx.cwd);
 
-    // Initial rescan if unindexed
     if (!currentStore.isLoaded || currentStore.nodes.length === 0) {
       const rootDir = ctx.cwd || process.cwd();
       const graph = await scanCodebase(rootDir);
       currentStore.setGraph(graph);
     }
 
-    // Decay stale ephemeral memories
     memory.decayEphemeralMemories(currentStore);
 
     const summary = currentStore.getSummary();
@@ -43,22 +41,29 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("graphify", `Graph: ${summary.totalNodes} nodes (${rules.length} rules)`);
   });
 
-  // Pre-Cognitive Associative Priming Interceptor (Zero-Turn Retrieval)
-  pi.on("turn_start", async (event: any, ctx: ExtensionContext) => {
+  // Inject Knowledge and Rules into System Prompt
+  pi.on("before_agent_start", async (event: any, ctx: ExtensionContext) => {
     const { store: currentStore } = getOrInitStore(ctx.cwd);
+    const baseSystemPrompt = event?.systemPrompt || "";
     const userPrompt = typeof event?.prompt === "string" ? event.prompt : "";
 
-    if (userPrompt && currentStore.isLoaded) {
-      const primed = getAssociativePrimedContext(userPrompt, currentStore, 400);
-
-      if (primed.hasContext) {
-        ctx.ui.notify(`[Associative Priming] Activated ${primed.matchedNodeIds.length} graph/rule nodes (~${primed.tokenEstimate} tokens).`, "info");
-      }
+    if (!currentStore.isLoaded) {
+      return { systemPrompt: baseSystemPrompt };
     }
+
+    const primed = getAssociativePrimedContext(userPrompt, currentStore, 500);
+
+    if (primed.hasContext) {
+      return {
+        systemPrompt: `${baseSystemPrompt}\n\n${primed.contextBlock}`,
+      };
+    }
+
+    return { systemPrompt: baseSystemPrompt };
   });
 
-  // Turn End: Automatic Background Memory Capture
-  pi.on("turn_end", async (event: any, ctx: ExtensionContext) => {
+  // Automatic Background Memory Capture
+  pi.on("agent_end", async (event: any, ctx: ExtensionContext) => {
     const { store: currentStore, memory } = getOrInitStore(ctx.cwd);
     const userPrompt = typeof event?.prompt === "string" ? event.prompt : "";
     const assistantResponse = typeof event?.response === "string" ? event.response : "";
@@ -73,55 +78,127 @@ export default function (pi: ExtensionAPI) {
 
         const { addedNodes } = currentStore.mergeGraph(nodes, edges);
         if (addedNodes > 0) {
-          ctx.ui.notify(`[Memory Engine] Recorded ${addedNodes} new memory nodes.`, "info");
+          memory.saveMemories(currentStore.nodes);
           ctx.ui.setStatus("graphify", `Graph: ${currentStore.nodes.length} nodes`);
         }
       }
     }
   });
 
-  // TOOL 1: Build / Rescan Codebase
+  // TOOL 1: graphify_query
   pi.registerTool({
-    name: "graphify_build",
-    label: "Build Knowledge Graph",
-    description: "Indexes repository AST, AGENTS.md rules, and schemas into a queryable knowledge graph.",
+    name: "graphify_query",
+    label: "Query Knowledge Graph",
+    description: "Queries the knowledge graph for information. Returns the path to the file that contains the information, line numbers, and summaries.",
     parameters: Type.Object({
-      force: Type.Optional(Type.Boolean({ description: "Force re-indexing" })),
+      query: Type.String({ description: "The keyword or phrase to search for in the knowledge graph." }),
+      depth: Type.Optional(Type.Number({ description: "How many connection hops to explore. Default is 1.", default: 1 })),
     }),
     execute: async (_toolCallId, params, _signal, _update, ctx) => {
       const { store: currentStore } = getOrInitStore(ctx.cwd);
-      const rootDir = ctx.cwd || process.cwd();
 
-      if (currentStore.isLoaded && currentStore.nodes.length > 0 && !params.force) {
+      if (!currentStore.isLoaded || currentStore.nodes.length === 0) {
         return {
-          content: [{ type: "text", text: `Graph already built with ${currentStore.nodes.length} nodes. Pass force=true to rebuild.` }],
-          details: { nodeCount: currentStore.nodes.length, edgeCount: currentStore.edges.length, rebuilt: false },
+          content: [{ type: "text", text: "The knowledge graph is empty. Use `graphify_build` to index the project." }],
+          details: { error: "NOT_INDEXED" },
         };
       }
 
-      ctx.ui.notify("Indexing repository codebase & AGENTS.md rules...", "info");
-      const graph = await scanCodebase(rootDir);
-      currentStore.setGraph(graph);
+      const queryStr = params.query?.trim() ?? "";
+      if (!queryStr) {
+        return {
+          content: [{ type: "text", text: "Please provide a search keyword." }],
+          details: { error: "EMPTY_QUERY" },
+        };
+      }
 
-      const outDir = join(rootDir, "graphify-out");
-      generateArtifacts(currentStore, outDir);
-      ctx.ui.setStatus("graphify", `Graph: ${currentStore.nodes.length} nodes`);
+      const searchResults = currentStore.searchNodes(queryStr, 6);
+      if (searchResults.length === 0) {
+        return {
+          content: [{ type: "text", text: `No information found for "${queryStr}". Try searching for a simpler keyword, or use graphify_add if you need to fetch external documentation.` }],
+          details: { matches: [] },
+        };
+      }
 
-      const summary = currentStore.getSummary();
+      const formattedResults = searchResults.map(({ node }) => {
+        const linesInfo = node.lineStart ? ` (lines ${node.lineStart}-${node.lineEnd})` : "";
+        return [
+          `- Name: ${node.name}`,
+          `  Type: ${node.kind}`,
+          `  File path: ${node.path}${linesInfo}`,
+          node.summary ? `  Summary: ${node.summary}` : "",
+          `  To read this file: use graphify_read with nodeId "${node.id}" or path "${node.path}"`,
+        ].filter(Boolean).join("\n");
+      });
+
       return {
-        content: [{ type: "text", text: `Knowledge graph generated: ${summary.totalNodes} nodes (${summary.kinds["rule"] || 0} rules, ${summary.totalEdges} edges).` }],
-        details: summary,
+        content: [
+          {
+            type: "text",
+            text: `Found information in the knowledge graph:\n\n${formattedResults.join("\n\n")}`,
+          },
+        ],
+        details: { matchCount: searchResults.length, topNodeId: searchResults[0].node.id },
       };
     },
   });
 
-  // TOOL 2: Add Document / GitHub Repo
+  // TOOL 2: graphify_read
+  pi.registerTool({
+    name: "graphify_read",
+    label: "Read File from Knowledge Graph",
+    description: "Reads a file or a section of a file from the knowledge graph.",
+    parameters: Type.Object({
+      nodeId: Type.String({ description: "The file path or node ID to read." }),
+    }),
+    execute: async (_toolCallId, params, _signal, _update, ctx) => {
+      const { store: currentStore } = getOrInitStore(ctx.cwd);
+      const rootDir = ctx.cwd || process.cwd();
+      const target = params.nodeId.trim();
+
+      const matchedNode = currentStore.nodes.find((n) => n.id === target || n.path === target);
+      const filePath = matchedNode ? matchedNode.path : target;
+      const absFilePath = resolve(rootDir, filePath);
+
+      if (!existsSync(absFilePath)) {
+        return {
+          content: [{ type: "text", text: `File not found: "${filePath}". Use graphify_query to find the correct file path.` }],
+          details: { error: "FILE_NOT_FOUND" },
+        };
+      }
+
+      try {
+        const fullContent = readFileSync(absFilePath, "utf-8");
+        const lines = fullContent.split("\n");
+
+        if (matchedNode && matchedNode.lineStart && matchedNode.lineEnd) {
+          const slice = lines.slice(matchedNode.lineStart - 1, matchedNode.lineEnd).join("\n");
+          return {
+            content: [{ type: "text", text: slice }],
+            details: { path: matchedNode.path, lines: [matchedNode.lineStart, matchedNode.lineEnd] },
+          };
+        }
+
+        return {
+          content: [{ type: "text", text: fullContent }],
+          details: { path: filePath, totalLines: lines.length },
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Error reading file: ${err.message}` }],
+          details: { error: err.message },
+        };
+      }
+    },
+  });
+
+  // TOOL 3: graphify_add
   pi.registerTool({
     name: "graphify_add",
-    label: "Add Document or Repo to Knowledge Graph",
-    description: "Fetches and saves documentation or GitHub repositories into the local vault (.pi/knowledge/) and indexes symbols.",
+    label: "Add Website or Repository",
+    description: "Fetches a website URL or clones a GitHub repository and adds its information to the knowledge graph.",
     parameters: Type.Object({
-      target: Type.String({ description: "The HTTP/HTTPS URL, GitHub repo URL, or local file path" }),
+      target: Type.String({ description: "The website URL, GitHub repository URL, or local file path to add." }),
     }),
     execute: async (_toolCallId, params, _signal, _update, ctx) => {
       const { store: currentStore } = getOrInitStore(ctx.cwd);
@@ -129,11 +206,14 @@ export default function (pi: ExtensionAPI) {
       const rootDir = ctx.cwd || process.cwd();
 
       if (!targetStr) {
-        return { content: [{ type: "text", text: "Target cannot be empty." }], details: { error: "EMPTY_TARGET" } };
+        return {
+          content: [{ type: "text", text: "Please provide a website URL or repository URL to add." }],
+          details: { error: "EMPTY_TARGET" },
+        };
       }
 
       try {
-        ctx.ui.notify(`Ingesting ${targetStr}...`, "info");
+        ctx.ui.notify(`Adding ${targetStr} to knowledge graph...`, "info");
         const docResult = await ingestTarget(targetStr, rootDir);
         const { addedNodes, addedEdges } = currentStore.mergeGraph(docResult.nodes, docResult.edges);
 
@@ -144,31 +224,35 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: [
-                `Successfully ingested "${docResult.title}":`,
-                `- Saved locally to: \`${docResult.savedPath}\``,
-                `- Added: ${addedNodes} nodes and ${addedEdges} connections.`,
-              ].join("\n"),
+              text: `Successfully added "${docResult.title}" to the knowledge graph (${addedNodes} new items saved to ${docResult.savedPath}). You can now use graphify_query to search for information from it.`,
             },
           ],
           details: { title: docResult.title, savedPath: docResult.savedPath, addedNodes, totalNodes: currentStore.nodes.length },
         };
       } catch (err: any) {
-        return { content: [{ type: "text", text: `Failed to ingest target: ${err.message}` }], details: { error: err.message } };
+        return {
+          content: [{ type: "text", text: `Failed to add target: ${err.message}` }],
+          details: { error: err.message },
+        };
       }
     },
   });
 
-  // TOOL 3: Explicit Memory Registration
+  // TOOL 4: graphify_remember
   pi.registerTool({
     name: "graphify_remember",
-    label: "Record Architectural Decision or Rule",
-    description: "Explicitly records a persistent architectural decision, user constraint, or plan in the knowledge graph.",
+    label: "Save Rule or Decision to Memory",
+    description: "Saves a rule, instruction, plan, decision, or note to your memory in the knowledge graph.",
     parameters: Type.Object({
-      title: Type.String({ description: "Short title of the rule, decision, or fact" }),
-      summary: Type.String({ description: "Complete explanation or directive" }),
-      kind: Type.Union([Type.Literal("constraint"), Type.Literal("decision"), Type.Literal("plan"), Type.Literal("fact")]),
-      targets: Type.Optional(Type.Array(Type.String({ description: "Target file paths or symbol IDs that this memory governs" }))),
+      title: Type.String({ description: "Short title of the instruction, rule, or decision." }),
+      summary: Type.String({ description: "The full rule, instruction, plan, or note to remember." }),
+      kind: Type.Union([
+        Type.Literal("constraint"),
+        Type.Literal("decision"),
+        Type.Literal("plan"),
+        Type.Literal("fact"),
+      ], { description: "The type: 'constraint' for rules/instructions, 'decision' for architecture choices, 'plan' for plans/steps, 'fact' for notes/facts." }),
+      targets: Type.Optional(Type.Array(Type.String({ description: "Optional file paths related to this memory." }))),
     }),
     execute: async (_toolCallId, params, _signal, _update, ctx) => {
       const { store: currentStore, memory } = getOrInitStore(ctx.cwd);
@@ -196,116 +280,59 @@ export default function (pi: ExtensionAPI) {
       }));
 
       currentStore.mergeGraph([newNode], newEdges);
+      memory.saveMemories(currentStore.nodes);
       ctx.ui.setStatus("graphify", `Graph: ${currentStore.nodes.length} nodes`);
 
       return {
-        content: [{ type: "text", text: `Recorded [${params.kind.toUpperCase()}] "${params.title}" into the knowledge graph.` }],
+        content: [{ type: "text", text: `Successfully saved "${params.title}" to memory.` }],
         details: { nodeId: id },
       };
     },
   });
 
-  // TOOL 4: Query Knowledge Graph
+  // TOOL 5: graphify_build
   pi.registerTool({
-    name: "graphify_query",
-    label: "Query Knowledge Graph",
-    description: "Searches symbols, documentation, rules, and decisions in the knowledge graph. Returns summaries, line numbers, and local paths.",
+    name: "graphify_build",
+    label: "Rebuild Knowledge Graph",
+    description: "Rebuilds the knowledge graph for the repository. Use this after making major code changes or when instructed.",
     parameters: Type.Object({
-      query: Type.String({ description: "Search query for symbols, concepts, rules, or topics" }),
-      depth: Type.Optional(Type.Number({ description: "Traversal depth", default: 1 })),
-    }),
-    execute: async (_toolCallId, params, _signal, _update, ctx) => {
-      const { store: currentStore } = getOrInitStore(ctx.cwd);
-
-      if (!currentStore.isLoaded || currentStore.nodes.length === 0) {
-        return { content: [{ type: "text", text: "Knowledge graph is unindexed. Run `graphify_build` first." }], details: { error: "NOT_INDEXED" } };
-      }
-
-      const queryStr = params.query?.trim() ?? "";
-      if (!queryStr) {
-        return { content: [{ type: "text", text: "Query cannot be empty." }], details: { error: "EMPTY_QUERY" } };
-      }
-
-      const searchResults = currentStore.searchNodes(queryStr, 6);
-      if (searchResults.length === 0) {
-        return { content: [{ type: "text", text: `No matching nodes found for "${queryStr}".` }], details: { matches: [] } };
-      }
-
-      const formattedResults = searchResults.map(({ node, score }) => {
-        const neighbors = currentStore.getNodeNeighbors(node.id, params.depth ?? 1);
-        const outList = neighbors?.outbound.map((o) => `    -> [${o.relation}] ${o.target.name || o.target.id} (${o.target.kind})`).join("\n") || "    (none)";
-        const inList = neighbors?.inbound.map((i) => `    <- [${i.relation}] ${i.source.name || i.source.id} (${i.source.kind})`).join("\n") || "    (none)";
-        const linesInfo = node.lineStart ? ` (Lines: ${node.lineStart}-${node.lineEnd})` : "";
-
-        return [
-          `### [${node.kind.toUpperCase()}] ${node.name} (Tier ${node.tier || "Standard"}, Score: ${score})`,
-          `Node ID: \`${node.id}\``,
-          `Local File Path: \`${node.path}\`${linesInfo}`,
-          node.summary ? `Summary: ${node.summary}` : "",
-          `Connections:`,
-          `  Outbound:`,
-          outList,
-          `  Inbound:`,
-          inList,
-        ].filter(Boolean).join("\n");
-      });
-
-      return {
-        content: [{ type: "text", text: formattedResults.join("\n\n---\n\n") }],
-        details: { matchCount: searchResults.length, topNodeId: searchResults[0].node.id },
-      };
-    },
-  });
-
-  // TOOL 5: Read Node Content
-  pi.registerTool({
-    name: "graphify_read",
-    label: "Read Knowledge Node Content",
-    description: "Reads the full Markdown section, code, or documentation slice corresponding to a specific node ID or local path.",
-    parameters: Type.Object({
-      nodeId: Type.String({ description: "The node ID or local file path to read" }),
+      force: Type.Optional(Type.Boolean({ description: "Set to true to force rebuilding the knowledge graph." })),
     }),
     execute: async (_toolCallId, params, _signal, _update, ctx) => {
       const { store: currentStore } = getOrInitStore(ctx.cwd);
       const rootDir = ctx.cwd || process.cwd();
-      const target = params.nodeId.trim();
 
-      const matchedNode = currentStore.nodes.find((n) => n.id === target || n.path === target);
-      const filePath = matchedNode ? matchedNode.path : target;
-      const absFilePath = resolve(rootDir, filePath);
-
-      if (!existsSync(absFilePath)) {
-        return { content: [{ type: "text", text: `File not found: ${filePath}` }], details: { error: "FILE_NOT_FOUND" } };
+      if (currentStore.isLoaded && currentStore.nodes.length > 0 && !params.force) {
+        return {
+          content: [{ type: "text", text: `Knowledge graph is already built (${currentStore.nodes.length} items). Pass force: true if you want to force a full rebuild.` }],
+          details: { nodeCount: currentStore.nodes.length, edgeCount: currentStore.edges.length, rebuilt: false },
+        };
       }
 
-      try {
-        const fullContent = readFileSync(absFilePath, "utf-8");
-        const lines = fullContent.split("\n");
+      ctx.ui.notify("Rebuilding knowledge graph...", "info");
+      const graph = await scanCodebase(rootDir);
+      currentStore.setGraph(graph);
 
-        if (matchedNode && matchedNode.lineStart && matchedNode.lineEnd) {
-          const slice = lines.slice(matchedNode.lineStart - 1, matchedNode.lineEnd).join("\n");
-          return {
-            content: [{ type: "text", text: `## ${matchedNode.name} (${matchedNode.path}:${matchedNode.lineStart}-${matchedNode.lineEnd})\n\n${slice}` }],
-            details: { path: matchedNode.path, lines: [matchedNode.lineStart, matchedNode.lineEnd] },
-          };
-        }
+      const outDir = join(rootDir, "graphify-out");
+      generateArtifacts(currentStore, outDir);
+      ctx.ui.setStatus("graphify", `Graph: ${currentStore.nodes.length} nodes`);
 
-        return { content: [{ type: "text", text: fullContent }], details: { path: filePath, totalLines: lines.length } };
-      } catch (err: any) {
-        return { content: [{ type: "text", text: `Error reading file: ${err.message}` }], details: { error: err.message } };
-      }
+      const summary = currentStore.getSummary();
+      return {
+        content: [{ type: "text", text: `Knowledge graph successfully rebuilt with ${summary.totalNodes} items.` }],
+        details: summary,
+      };
     },
   });
 
   // Slash Command: /graphify
   pi.registerCommand("graphify", {
-    description: "Graphify Knowledge & Memory Manager (add, rebuild, remember, rules, report)",
+    description: "Manage the knowledge graph (remember, rules, add, rebuild)",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       const { store: currentStore, memory } = getOrInitStore(ctx.cwd);
       const rootDir = ctx.cwd || process.cwd();
 
-      // /graphify remember <text>
       if (trimmed.startsWith("remember ")) {
         const text = trimmed.slice(9).trim();
         const slug = encodeURIComponent(text.slice(0, 25).toLowerCase().replace(/[^a-z0-9]+/g, "-"));
@@ -324,47 +351,45 @@ export default function (pi: ExtensionAPI) {
           },
         ], []);
 
+        memory.saveMemories(currentStore.nodes);
         ctx.ui.setStatus("graphify", `Graph: ${currentStore.nodes.length} nodes`);
-        ctx.ui.notify(`Remembered permanent constraint: "${text}"`, "info");
+        ctx.ui.notify(`Saved rule to memory: "${text}"`, "info");
         return;
       }
 
-      // /graphify rules
       if (trimmed === "rules") {
         const rules = currentStore.nodes.filter((n) => n.kind === "rule" || n.kind === "constraint");
         ctx.ui.notify(`Active Rules (${rules.length}):\n` + rules.map((r) => `- [${r.kind.toUpperCase()}] ${r.name}: ${r.summary}`).join("\n"), "info");
         return;
       }
 
-      // /graphify add <target>
       if (trimmed.startsWith("add ")) {
         const target = trimmed.slice(4).trim();
-        ctx.ui.notify(`Ingesting ${target}...`, "info");
+        ctx.ui.notify(`Adding ${target}...`, "info");
         try {
           const res = await ingestTarget(target, rootDir);
           const { addedNodes, addedEdges } = currentStore.mergeGraph(res.nodes, res.edges);
           generateArtifacts(currentStore, join(rootDir, "graphify-out"));
           ctx.ui.setStatus("graphify", `Graph: ${currentStore.nodes.length} nodes`);
-          ctx.ui.notify(`Ingested "${res.title}": +${addedNodes} nodes, +${addedEdges} edges.`, "info");
+          ctx.ui.notify(`Added "${res.title}" (+${addedNodes} items)`, "info");
         } catch (err: any) {
           ctx.ui.notify(`Failed: ${err.message}`, "error");
         }
         return;
       }
 
-      // /graphify rebuild
       if (trimmed === "rebuild" || !currentStore.isLoaded || currentStore.nodes.length === 0) {
-        ctx.ui.notify("Rebuilding graph & AGENTS.md rules...", "info");
+        ctx.ui.notify("Rebuilding knowledge graph...", "info");
         const graph = await scanCodebase(rootDir);
         currentStore.setGraph(graph);
         const artifacts = generateArtifacts(currentStore, join(rootDir, "graphify-out"));
         ctx.ui.setStatus("graphify", `Graph: ${graph.nodes.length} nodes`);
-        ctx.ui.notify(`Graph built: ${graph.nodes.length} nodes. Report: ${artifacts.reportPath}`, "info");
+        ctx.ui.notify(`Knowledge graph rebuilt (${graph.nodes.length} items). Report saved to ${artifacts.reportPath}`, "info");
         return;
       }
 
       const summary = currentStore.getSummary();
-      ctx.ui.notify(`Knowledge Graph: ${summary.totalNodes} nodes, ${summary.totalEdges} edges, ${summary.totalCommunities} communities.`, "info");
+      ctx.ui.notify(`Knowledge Graph: ${summary.totalNodes} items, ${summary.totalEdges} connections.`, "info");
     },
   });
 }

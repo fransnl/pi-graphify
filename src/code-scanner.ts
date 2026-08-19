@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join, relative, extname, resolve } from "node:path";
 import type { KnowledgeGraph, GraphNode, GraphEdge } from "./types.js";
 import { parseAgentsRules } from "./agents-md-parser.js";
@@ -26,7 +26,8 @@ export async function scanCodebase(targetDir: string): Promise<KnowledgeGraph> {
   nodes.push(...ruleResult.nodes);
   edges.push(...ruleResult.edges);
 
-  function walk(currentDir: string): void {
+  // 2. Scan Local Project Source Files
+  function walkLocal(currentDir: string): void {
     let entries;
     try {
       entries = readdirSync(currentDir, { withFileTypes: true });
@@ -43,14 +44,17 @@ export async function scanCodebase(targetDir: string): Promise<KnowledgeGraph> {
       const relPath = relative(rootPath, fullPath) || entry.name;
 
       if (entry.isDirectory()) {
-        walk(fullPath);
+        walkLocal(fullPath);
       } else if (entry.isFile()) {
         parseSourceFile(fullPath, relPath, nodes, edges);
       }
     }
   }
 
-  walk(rootPath);
+  walkLocal(rootPath);
+
+  // 3. Rescan and Restore Persistent Knowledge Vault (.pi/knowledge/)
+  await scanKnowledgeVault(rootPath, nodes, edges);
 
   return {
     version: "1.0.0",
@@ -58,6 +62,189 @@ export async function scanCodebase(targetDir: string): Promise<KnowledgeGraph> {
     nodes,
     edges,
   };
+}
+
+/**
+ * Rescans all persistent documents, cloned repos, and memories from .pi/knowledge/
+ */
+async function scanKnowledgeVault(workspaceRoot: string, nodes: GraphNode[], edges: GraphEdge[]): Promise<void> {
+  const vaultPath = join(workspaceRoot, ".pi", "knowledge");
+  if (!existsSync(vaultPath)) return;
+
+  // A. Rescan Ingested Web Docs (.pi/knowledge/docs/)
+  const docsVault = join(vaultPath, "docs");
+  if (existsSync(docsVault)) {
+    function walkDocs(currentDir: string): void {
+      const entries = readdirSync(currentDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = join(currentDir, entry.name);
+        const relPath = relative(workspaceRoot, fullPath);
+
+        if (entry.isDirectory()) {
+          walkDocs(fullPath);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          parseVaultDocFile(fullPath, relPath, nodes, edges);
+        }
+      }
+    }
+    try {
+      walkDocs(docsVault);
+    } catch {
+      // Ignore directory read errors
+    }
+  }
+
+  // B. Rescan Ingested Cloned Repositories (.pi/knowledge/repos/)
+  const reposVault = join(vaultPath, "repos");
+  if (existsSync(reposVault)) {
+    try {
+      const owners = readdirSync(reposVault, { withFileTypes: true }).filter((e) => e.isDirectory());
+      for (const owner of owners) {
+        const ownerPath = join(reposVault, owner.name);
+        const repoDirs = readdirSync(ownerPath, { withFileTypes: true }).filter((e) => e.isDirectory());
+
+        for (const repo of repoDirs) {
+          const repoFullPath = join(ownerPath, repo.name);
+          const repoName = `${owner.name}/${repo.name}`;
+          const repoNamespace = `repo://${repoName}`;
+          const relativeRepoPath = relative(workspaceRoot, repoFullPath);
+
+          // Root Module Node
+          nodes.push({
+            id: repoNamespace,
+            name: repoName,
+            kind: "module",
+            path: relativeRepoPath,
+            summary: `Cloned repository: ${repoName}`,
+          });
+
+          // Scan repo source files
+          function walkRepo(currentDir: string): void {
+            const entries = readdirSync(currentDir, { withFileTypes: true });
+            for (const entry of entries) {
+              if (IGNORED_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+              const subPath = join(currentDir, entry.name);
+              const subRelPath = relative(workspaceRoot, subPath);
+
+              if (entry.isDirectory()) {
+                walkRepo(subPath);
+              } else if (entry.isFile()) {
+                parseSourceFile(subPath, subRelPath, nodes, edges);
+              }
+            }
+          }
+          walkRepo(repoFullPath);
+        }
+      }
+    } catch {
+      // Ignore repo scan errors
+    }
+  }
+
+  // C. Rescan Persistent Memories (.pi/knowledge/memory/memory.json)
+  const memoryFile = join(vaultPath, "memory", "memory.json");
+  if (existsSync(memoryFile)) {
+    try {
+      const raw = readFileSync(memoryFile, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed.items)) {
+        for (const item of parsed.items) {
+          nodes.push(item);
+        }
+      }
+    } catch {
+      // Ignore corrupted memory file
+    }
+  }
+}
+
+/**
+ * Parses Markdown files stored in .pi/knowledge/docs/ and reconstructs concept nodes with line ranges
+ */
+function parseVaultDocFile(fullPath: string, relPath: string, nodes: GraphNode[], edges: GraphEdge[]): void {
+  try {
+    const content = readFileSync(fullPath, "utf-8");
+    const lines = content.split(/\r?\n/);
+    const titleMatch = content.match(/^#\s+(.+)$/m);
+    const title = titleMatch ? titleMatch[1].trim() : relPath;
+
+    const parts = relPath.replace(/^(\.pi\/knowledge\/docs\/)/, "").split("/");
+    const docNodeId = `doc://${parts.join("/")}`;
+
+    // Root Document Node
+    nodes.push({
+      id: docNodeId,
+      name: title,
+      kind: "doc",
+      path: relPath,
+      summary: lines.slice(4, 12).join(" ").slice(0, 300) || `Documentation for ${title}`,
+      lineStart: 1,
+      lineEnd: lines.length,
+    });
+
+    // Re-index Section Concept Nodes
+    let currentSection: { name: string; start: number } | null = null;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const headerMatch = line.match(/^(#{2,3})\s+(.+)$/);
+
+      if (headerMatch) {
+        if (currentSection) {
+          const sectionSlug = encodeURIComponent(currentSection.name.toLowerCase().replace(/[^a-z0-9]+/g, "-"));
+          const sectionId = `${docNodeId}#${sectionSlug}`;
+          const sectionText = lines.slice(currentSection.start - 1, i).join(" ").slice(0, 400);
+
+          nodes.push({
+            id: sectionId,
+            name: currentSection.name,
+            kind: "concept",
+            path: relPath,
+            summary: sectionText,
+            lineStart: currentSection.start,
+            lineEnd: i,
+          });
+
+          edges.push({
+            source: docNodeId,
+            target: sectionId,
+            relation: "defines",
+            provenance: "EXTRACTED",
+          });
+        }
+
+        currentSection = {
+          name: headerMatch[2].trim(),
+          start: i + 1,
+        };
+      }
+    }
+
+    if (currentSection) {
+      const sectionSlug = encodeURIComponent(currentSection.name.toLowerCase().replace(/[^a-z0-9]+/g, "-"));
+      const sectionId = `${docNodeId}#${sectionSlug}`;
+      const sectionText = lines.slice(currentSection.start - 1).join(" ").slice(0, 400);
+
+      nodes.push({
+        id: sectionId,
+        name: currentSection.name,
+        kind: "concept",
+        path: relPath,
+        summary: sectionText,
+        lineStart: currentSection.start,
+        lineEnd: lines.length,
+      });
+
+      edges.push({
+        source: docNodeId,
+        target: sectionId,
+        relation: "defines",
+        provenance: "EXTRACTED",
+      });
+    }
+  } catch {
+    // Non-parseable file
+  }
 }
 
 function parseSourceFile(fullPath: string, relPath: string, nodes: GraphNode[], edges: GraphEdge[]): void {
@@ -93,7 +280,7 @@ function parseSourceFile(fullPath: string, relPath: string, nodes: GraphNode[], 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
 
-      // TS/JS Imports
+      // Imports
       const tsImport = line.match(/import\s+.*?from\s+['"](.*?)['"]/);
       if (tsImport) {
         edges.push({
@@ -153,6 +340,6 @@ function parseSourceFile(fullPath: string, relPath: string, nodes: GraphNode[], 
       }
     }
   } catch {
-    // Binary or unreadable
+    // Non-parseable
   }
 }
