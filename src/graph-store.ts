@@ -39,7 +39,6 @@ export class GraphStore {
   public setGraph(graph: KnowledgeGraph): void {
     this.graph = graph;
     this.isInitialized = true;
-    this.recomputeCommunities();
     this.rebuildIndices();
     this.save();
   }
@@ -57,11 +56,9 @@ export class GraphStore {
         existingNodeMap.set(node.id, node);
         addedNodes++;
       } else {
-        // Update summary if previously empty
         const existing = existingNodeMap.get(node.id)!;
-        if (!existing.summary && node.summary) {
-          existing.summary = node.summary;
-        }
+        if (!existing.summary && node.summary) existing.summary = node.summary;
+        if (node.supersededBy) existing.supersededBy = node.supersededBy;
       }
     }
 
@@ -75,7 +72,6 @@ export class GraphStore {
     }
 
     this.isInitialized = true;
-    this.recomputeCommunities();
     this.rebuildIndices();
     this.save();
 
@@ -83,9 +79,7 @@ export class GraphStore {
   }
 
   public load(): boolean {
-    if (!existsSync(this.storagePath)) {
-      return false;
-    }
+    if (!existsSync(this.storagePath)) return false;
     try {
       const raw = readFileSync(this.storagePath, "utf-8");
       this.graph = JSON.parse(raw);
@@ -102,7 +96,7 @@ export class GraphStore {
       mkdirSync(dirname(this.storagePath), { recursive: true });
       writeFileSync(this.storagePath, JSON.stringify(this.graph, null, 2), "utf-8");
     } catch (err) {
-      console.error(`[pi-graphify] Failed to save graph to ${this.storagePath}:`, err);
+      console.error(`[pi-graphify] Save failed: ${this.storagePath}`, err);
     }
   }
 
@@ -118,74 +112,16 @@ export class GraphStore {
     }
 
     for (const edge of this.graph.edges) {
-      if (!this.adjacency.has(edge.source)) {
-        this.adjacency.set(edge.source, []);
-      }
+      if (!this.adjacency.has(edge.source)) this.adjacency.set(edge.source, []);
       this.adjacency.get(edge.source)?.push({ target: edge.target, relation: edge.relation });
 
-      if (!this.reverseAdjacency.has(edge.target)) {
-        this.reverseAdjacency.set(edge.target, []);
-      }
+      if (!this.reverseAdjacency.has(edge.target)) this.reverseAdjacency.set(edge.target, []);
       this.reverseAdjacency.get(edge.target)?.push({ source: edge.source, relation: edge.relation });
     }
   }
 
-  /**
-   * Topological Community Partitioning algorithm.
-   */
-  public recomputeCommunities(): void {
-    const visited = new Set<string>();
-    const clusters: CommunityCluster[] = [];
-    let communityId = 1;
-
-    for (const node of this.graph.nodes) {
-      if (visited.has(node.id)) continue;
-
-      const clusterNodeIds: string[] = [];
-      const queue: string[] = [node.id];
-      visited.add(node.id);
-
-      while (queue.length > 0) {
-        const current = queue.shift()!;
-        clusterNodeIds.push(current);
-
-        const outNeighbors = (this.adjacency.get(current) || []).map((e) => e.target);
-        const inNeighbors = (this.reverseAdjacency.get(current) || []).map((e) => e.source);
-
-        for (const neighborId of [...outNeighbors, ...inNeighbors]) {
-          if (!visited.has(neighborId) && this.nodeMap.has(neighborId)) {
-            visited.add(neighborId);
-            queue.push(neighborId);
-          }
-        }
-      }
-
-      for (const nId of clusterNodeIds) {
-        const n = this.nodeMap.get(nId);
-        if (n) n.community = communityId;
-      }
-
-      clusters.push({
-        id: communityId,
-        name: `Cluster ${communityId} (${node.name})`,
-        nodeIds: clusterNodeIds,
-      });
-
-      communityId++;
-    }
-
-    this.graph.communities = clusters;
-  }
-
-  /**
-   * Multi-term ranked fuzzy search on ID, Name, Path, and Summary text.
-   */
   public searchNodes(query: string, limit = 10): Array<{ node: GraphNode; score: number }> {
-    const queryTokens = query
-      .toLowerCase()
-      .split(/[\s,/:#.-]+/)
-      .filter((t) => t.length > 1);
-
+    const queryTokens = query.toLowerCase().split(/[\s,/:#.-]+/).filter((t) => t.length > 1);
     if (queryTokens.length === 0) {
       return this.graph.nodes.slice(0, limit).map((node) => ({ node, score: 1 }));
     }
@@ -197,13 +133,17 @@ export class GraphStore {
       const pathLower = node.path.toLowerCase();
       const summaryLower = (node.summary || "").toLowerCase();
 
-      for (const token of queryTokens) {
-        if (nameLower === token) score += 20;
-        else if (nameLower.includes(token)) score += 10;
+      // Tier Priority Weights
+      if (node.tier === 1) score += 25; // Tier 1 constitutional rules
+      if (node.tier === 2 && !node.supersededBy) score += 15; // Active decisions
 
-        if (idLower.includes(token)) score += 8;
-        if (summaryLower.includes(token)) score += 5;
-        if (pathLower.includes(token)) score += 3;
+      for (const token of queryTokens) {
+        if (nameLower === token) score += 30;
+        else if (nameLower.includes(token)) score += 15;
+
+        if (idLower.includes(token)) score += 10;
+        if (summaryLower.includes(token)) score += 8;
+        if (pathLower.includes(token)) score += 5;
       }
 
       return { node, score };
@@ -215,11 +155,7 @@ export class GraphStore {
       .slice(0, limit);
   }
 
-  public getNodeNeighbors(nodeId: string, _depth = 1): {
-    node: GraphNode;
-    outbound: Array<{ target: GraphNode | { id: string; name: string; kind: NodeKind; path: string; summary?: string }; relation: string }>;
-    inbound: Array<{ source: GraphNode | { id: string; name: string; kind: NodeKind; path: string; summary?: string }; relation: string }>;
-  } | null {
+  public getNodeNeighbors(nodeId: string, _depth = 1) {
     const node = this.nodeMap.get(nodeId);
     if (!node) return null;
 
@@ -237,9 +173,7 @@ export class GraphStore {
   }
 
   public tracePath(sourceId: string, targetId: string): string[] | null {
-    if (!this.nodeMap.has(sourceId) || !this.nodeMap.has(targetId)) {
-      return null;
-    }
+    if (!this.nodeMap.has(sourceId) || !this.nodeMap.has(targetId)) return null;
 
     const queue: Array<{ id: string; path: string[] }> = [{ id: sourceId, path: [sourceId] }];
     const visited = new Set<string>([sourceId]);
@@ -248,8 +182,7 @@ export class GraphStore {
       const { id, path } = queue.shift()!;
       if (id === targetId) return path;
 
-      const neighbors = (this.adjacency.get(id) || []).map((e) => e.target);
-      for (const next of neighbors) {
+      for (const next of (this.adjacency.get(id) || []).map((e) => e.target)) {
         if (!visited.has(next)) {
           visited.add(next);
           queue.push({ id: next, path: [...path, next] });
@@ -259,7 +192,7 @@ export class GraphStore {
     return null;
   }
 
-  public getGodNodes(limit = 6): Array<{ node: GraphNode; degree: number; inDegree: number; outDegree: number }> {
+  public getGodNodes(limit = 6) {
     const degrees = this.graph.nodes.map((node) => {
       const outDeg = this.adjacency.get(node.id)?.length || 0;
       const inDeg = this.reverseAdjacency.get(node.id)?.length || 0;
@@ -271,9 +204,7 @@ export class GraphStore {
 
   public getSummary() {
     const kinds: Record<string, number> = {};
-    for (const n of this.graph.nodes) {
-      kinds[n.kind] = (kinds[n.kind] || 0) + 1;
-    }
+    for (const n of this.graph.nodes) kinds[n.kind] = (kinds[n.kind] || 0) + 1;
 
     return {
       totalNodes: this.graph.nodes.length,

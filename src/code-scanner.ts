@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, extname, resolve } from "node:path";
 import type { KnowledgeGraph, GraphNode, GraphEdge } from "./types.js";
+import { parseAgentsRules } from "./agents-md-parser.js";
 
 const IGNORED_DIRS = new Set([
   "node_modules",
@@ -13,13 +14,17 @@ const IGNORED_DIRS = new Set([
   "__pycache__",
   "venv",
   ".venv",
-  ".cache",
 ]);
 
 export async function scanCodebase(targetDir: string): Promise<KnowledgeGraph> {
   const rootPath = resolve(targetDir);
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
+
+  // 1. Ingest Constitutional Rules from AGENTS.md / CLAUDE.md
+  const ruleResult = parseAgentsRules(rootPath);
+  nodes.push(...ruleResult.nodes);
+  edges.push(...ruleResult.edges);
 
   function walk(currentDir: string): void {
     let entries;
@@ -64,11 +69,9 @@ function parseSourceFile(fullPath: string, relPath: string, nodes: GraphNode[], 
     const raw = readFileSync(fullPath, "utf-8");
     const firstLines = raw.split("\n").slice(0, 10).join(" ");
     const headerMatch = firstLines.match(/\/\*\*?([\s\S]*?)\*\//) || firstLines.match(/"""([\s\S]*?)"""/);
-    if (headerMatch) {
-      docHeader = headerMatch[1].replace(/[*#]/g, "").trim().slice(0, 200);
-    }
+    if (headerMatch) docHeader = headerMatch[1].replace(/[*#]/g, "").trim().slice(0, 200);
   } catch {
-    // Non-text file
+    // Non-text
   }
 
   nodes.push({
@@ -87,26 +90,15 @@ function parseSourceFile(fullPath: string, relPath: string, nodes: GraphNode[], 
     const content = readFileSync(fullPath, "utf-8");
     const lines = content.split(/\r?\n/);
 
-    for (const line of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
       // TS/JS Imports
       const tsImport = line.match(/import\s+.*?from\s+['"](.*?)['"]/);
       if (tsImport) {
-        const target = tsImport[1];
         edges.push({
           source: fileNodeId,
-          target: target.startsWith(".") ? `file://${target}` : `pkg://${target}`,
-          relation: "imports",
-          provenance: "EXTRACTED",
-        });
-      }
-
-      // Python Imports
-      const pyImport = line.match(/^(?:from\s+([A-Za-z0-9_.]+)\s+import|import\s+([A-Za-z0-9_.]+))/);
-      if (pyImport) {
-        const mod = pyImport[1] || pyImport[2];
-        edges.push({
-          source: fileNodeId,
-          target: `py://${mod}`,
+          target: tsImport[1].startsWith(".") ? `file://${tsImport[1]}` : `pkg://${tsImport[1]}`,
           relation: "imports",
           provenance: "EXTRACTED",
         });
@@ -115,64 +107,52 @@ function parseSourceFile(fullPath: string, relPath: string, nodes: GraphNode[], 
       // Classes
       const classMatch = line.match(/(?:export\s+)?class\s+([A-Za-z0-9_]+)/);
       if (classMatch) {
-        const className = classMatch[1];
-        const classNodeId = `${fileNodeId}#${className}`;
+        const classNodeId = `${fileNodeId}#${classMatch[1]}`;
         nodes.push({
           id: classNodeId,
-          name: className,
+          name: classMatch[1],
           kind: "class",
           path: relPath,
-          summary: `Class ${className} declared in ${relPath}`,
+          lineStart: i + 1,
+          lineEnd: i + 1,
+          summary: `Class ${classMatch[1]} in ${relPath}`,
         });
-        edges.push({
-          source: fileNodeId,
-          target: classNodeId,
-          relation: "defines",
-          provenance: "EXTRACTED",
-        });
+        edges.push({ source: fileNodeId, target: classNodeId, relation: "defines", provenance: "EXTRACTED" });
       }
 
       // Functions
       const fnMatch = line.match(/(?:export\s+)?(?:async\s+)?(?:def|function|func|fn)\s+([A-Za-z0-9_]+)/);
       if (fnMatch) {
-        const fnName = fnMatch[1];
-        const fnNodeId = `${fileNodeId}#${fnName}`;
+        const fnNodeId = `${fileNodeId}#${fnMatch[1]}`;
         nodes.push({
           id: fnNodeId,
-          name: fnName,
+          name: fnMatch[1],
           kind: "function",
           path: relPath,
-          summary: `Function ${fnName} in ${relPath}`,
+          lineStart: i + 1,
+          lineEnd: i + 1,
+          summary: `Function ${fnMatch[1]} in ${relPath}`,
         });
-        edges.push({
-          source: fileNodeId,
-          target: fnNodeId,
-          relation: "defines",
-          provenance: "EXTRACTED",
-        });
+        edges.push({ source: fileNodeId, target: fnNodeId, relation: "defines", provenance: "EXTRACTED" });
       }
 
       // SQL Tables
       const sqlMatch = line.match(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_]+)/i);
       if (sqlMatch) {
-        const tableName = sqlMatch[1];
-        const tableNodeId = `db://table/${tableName}`;
+        const tableNodeId = `db://table/${sqlMatch[1]}`;
         nodes.push({
           id: tableNodeId,
-          name: tableName,
+          name: sqlMatch[1],
           kind: "table",
           path: relPath,
-          summary: `Database table ${tableName} defined in ${relPath}`,
+          lineStart: i + 1,
+          lineEnd: i + 1,
+          summary: `Database table ${sqlMatch[1]}`,
         });
-        edges.push({
-          source: fileNodeId,
-          target: tableNodeId,
-          relation: "defines",
-          provenance: "EXTRACTED",
-        });
+        edges.push({ source: fileNodeId, target: tableNodeId, relation: "defines", provenance: "EXTRACTED" });
       }
     }
   } catch {
-    // Skip binary/unreadable files
+    // Binary or unreadable
   }
 }

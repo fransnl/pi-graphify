@@ -1,5 +1,5 @@
-import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { join, dirname, relative } from "node:path";
 import type { GraphNode, GraphEdge } from "./types.js";
 import { isGitHubRepoUrl, ingestGitHubRepo } from "./repo-ingester.js";
 
@@ -8,34 +8,26 @@ export interface IngestionResult {
   edges: GraphEdge[];
   title: string;
   summary: string;
+  savedPath: string;
 }
 
-export async function ingestTarget(target: string): Promise<IngestionResult> {
+export async function ingestTarget(target: string, workspaceRoot: string): Promise<IngestionResult> {
   const trimmed = target.trim();
 
-  // 1. GitHub Repository URL
+  // 1. GitHub Repositories
   if (isGitHubRepoUrl(trimmed)) {
-    const repoResult = await ingestGitHubRepo(trimmed);
-    return {
-      nodes: repoResult.nodes,
-      edges: repoResult.edges,
-      title: repoResult.repoName,
-      summary: `Cloned and scanned GitHub repository ${repoResult.repoName} (${repoResult.totalFiles} files).`,
-    };
+    return ingestGitHubRepo(trimmed, workspaceRoot);
   }
 
-  // 2. Standard Web Documentation URL
+  // 2. Remote Web Documentation
   if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-    return ingestUrl(trimmed);
+    return ingestUrlToVault(trimmed, workspaceRoot);
   }
 
-  // 3. Local File / Path
-  return ingestLocalFile(trimmed);
+  // 3. Local Files
+  return ingestLocalFileToVault(trimmed, workspaceRoot);
 }
 
-/**
- * Strips scripts, styles, navigation bars, headers, footers, and table-of-contents elements.
- */
 function cleanHtml(rawHtml: string): string {
   return rawHtml
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
@@ -47,9 +39,6 @@ function cleanHtml(rawHtml: string): string {
     .replace(/<div[^>]*class=["'][^"']*(?:sidebar|toc|menu|nav|breadcrumbs)[^"']*["'][^>]*>.*?<\/div>/gis, "");
 }
 
-/**
- * Strips remaining HTML tags and normalizes whitespace.
- */
 function stripTags(html: string): string {
   return html
     .replace(/<[^>]+>/g, " ")
@@ -63,7 +52,34 @@ function stripTags(html: string): string {
     .trim();
 }
 
-export async function ingestUrl(urlStr: string): Promise<IngestionResult> {
+/**
+ * Converts sanitized HTML into clean, readable Markdown.
+ */
+function htmlToMarkdown(html: string): string {
+  let md = html
+    .replace(/<h1[^>]*>(.*?)<\/h1>/gi, "\n# $1\n\n")
+    .replace(/<h2[^>]*>(.*?)<\/h2>/gi, "\n## $1\n\n")
+    .replace(/<h3[^>]*>(.*?)<\/h3>/gi, "\n### $1\n\n")
+    .replace(/<h4[^>]*>(.*?)<\/h4>/gi, "\n#### $1\n\n")
+    .replace(/<p[^>]*>(.*?)<\/p>/gis, "$1\n\n")
+    .replace(/<pre><code(?: class=["'](?:language-)?([a-z0-9_-]+)["'])?[^>]*>([\s\S]*?)<\/code><\/pre>/gi, (_m, lang, code) => {
+      const cleanCode = code
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&amp;/g, "&");
+      return `\n\`\`\`${lang || ""}\n${cleanCode.trim()}\n\`\`\`\n\n`;
+    })
+    .replace(/<code>(.*?)<\/code>/gi, "`$1`")
+    .replace(/<li[^>]*>(.*?)<\/li>/gis, "* $1\n")
+    .replace(/<ul[^>]*>([\s\S]*?)<\/ul>/gis, "$1\n")
+    .replace(/<ol[^>]*>([\s\S]*?)<\/ol>/gis, "$1\n");
+
+  return stripTags(md)
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+export async function ingestUrlToVault(urlStr: string, workspaceRoot: string): Promise<IngestionResult> {
   const url = new URL(urlStr);
   const response = await fetch(url.toString(), {
     headers: {
@@ -76,147 +92,153 @@ export async function ingestUrl(urlStr: string): Promise<IngestionResult> {
     throw new Error(`Failed to fetch ${urlStr}: ${response.status} ${response.statusText}`);
   }
 
-  const raw = await response.text();
-  return parseDocumentContent(raw, url.toString(), url.hostname + url.pathname);
-}
+  const rawHtml = await response.text();
+  const cleanedHtml = cleanHtml(rawHtml);
 
-export async function ingestLocalFile(filePath: string): Promise<IngestionResult> {
-  const absPath = resolve(filePath);
-  if (!existsSync(absPath)) {
-    throw new Error(`File not found: ${filePath}`);
-  }
-  const content = readFileSync(absPath, "utf-8");
-  return parseDocumentContent(content, filePath, filePath);
-}
+  // Extract Page Title
+  const titleMatch = cleanedHtml.match(/<title>(.*?)<\/title>/i) || cleanedHtml.match(/<h1[^>]*>(.*?)<\/h1>/i);
+  const pageTitle = titleMatch ? stripTags(titleMatch[1]).replace(/\s*·.*$/, "").trim() : url.pathname;
 
-function parseDocumentContent(rawContent: string, sourcePath: string, rootIdKey: string): IngestionResult {
-  const isHtml = /<[a-z][\s\S]*>/i.test(rawContent);
-  const cleaned = isHtml ? cleanHtml(rawContent) : rawContent;
+  // Convert to Markdown
+  const markdownContent = [
+    `# ${pageTitle}`,
+    `Source: ${url.toString()}`,
+    `Ingested: ${new Date().toISOString()}`,
+    ``,
+    htmlToMarkdown(cleanedHtml),
+  ].join("\n");
 
+  // Determine local destination path in .pi/knowledge/docs/
+  const sanitizedPath = url.pathname.replace(/^\/|\/$/g, "").replace(/\//g, "-") || "index";
+  const relativeVaultPath = join(".pi", "knowledge", "docs", url.hostname, `${sanitizedPath}.md`);
+  const absoluteVaultPath = join(workspaceRoot, relativeVaultPath);
+
+  // Save the full Markdown document locally
+  mkdirSync(dirname(absoluteVaultPath), { recursive: true });
+  writeFileSync(absoluteVaultPath, markdownContent, "utf-8");
+
+  // Parse lines to build indexed graph nodes with exact line numbers
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
+  const lines = markdownContent.split("\n");
 
-  // Extract Page / Document Title
-  const titleMatch = cleaned.match(/<title>(.*?)<\/title>/i) || cleaned.match(/^#\s+(.+)$/m);
-  const title = titleMatch ? stripTags(titleMatch[1]).replace(/\s*·.*$/, "") : rootIdKey;
-
-  const docNodeId = `doc://${rootIdKey.replace(/^[./]+/, "")}`;
-
-  // Extract first 2-3 paragraphs for top-level document summary
-  const paragraphMatches = cleaned.match(/<p\b[^>]*>(.*?)<\/p>/gis) || [];
-  const paragraphs = paragraphMatches
-    .map(stripTags)
-    .filter((p) => p.length > 30)
-    .slice(0, 3);
-  const docSummary = paragraphs.join(" ");
+  const rootDocNodeId = `doc://${url.hostname}/${sanitizedPath}`;
+  const docSummary = lines.slice(4, 15).join(" ").slice(0, 300);
 
   nodes.push({
-    id: docNodeId,
-    name: title,
+    id: rootDocNodeId,
+    name: pageTitle,
     kind: "doc",
-    path: sourcePath,
-    summary: docSummary || `Documentation for ${title}`,
+    path: relativeVaultPath,
+    sourceUrl: urlStr,
+    summary: docSummary || `Documentation for ${pageTitle}`,
+    lineStart: 1,
+    lineEnd: lines.length,
     metadata: {
-      source: sourcePath,
-      indexedAt: new Date().toISOString(),
+      hostname: url.hostname,
+      sourceUrl: urlStr,
     },
   });
 
-  // Extract Structured Sections (H1, H2, H3 or Markdown #, ##, ###)
-  const sectionPattern = isHtml
-    ? /<h([1-3])[^>]*>(.*?)<\/h\1>([\s\S]*?)(?=<h[1-3]|$)/gi
-    : /^(#{1,3})\s+(.+)$([\s\S]*?)(?=^#{1,3}\s+|$)/gim;
+  // Extract Section Nodes with precise line bounds
+  let currentSection: { name: string; start: number } | null = null;
 
-  let sectionMatch: RegExpExecArray | null;
-  const seenSections = new Set<string>();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const headerMatch = line.match(/^(#{2,3})\s+(.+)$/);
 
-  while ((sectionMatch = sectionPattern.exec(cleaned)) !== null) {
-    const rawHeading = isHtml ? sectionMatch[2] : sectionMatch[2];
-    const sectionBody = isHtml ? sectionMatch[3] : sectionMatch[3];
+    if (headerMatch) {
+      if (currentSection) {
+        // Finalize previous section
+        const sectionSlug = encodeURIComponent(currentSection.name.toLowerCase().replace(/[^a-z0-9]+/g, "-"));
+        const sectionId = `${rootDocNodeId}#${sectionSlug}`;
+        const sectionText = lines.slice(currentSection.start - 1, i).join(" ").slice(0, 400);
 
-    const headingText = stripTags(rawHeading).trim();
-    if (!headingText || headingText.toLowerCase() === title.toLowerCase() || headingText.length > 80) {
-      continue;
-    }
+        nodes.push({
+          id: sectionId,
+          name: currentSection.name,
+          kind: "concept",
+          path: relativeVaultPath,
+          sourceUrl: urlStr,
+          summary: sectionText,
+          lineStart: currentSection.start,
+          lineEnd: i,
+        });
 
-    // Skip generic navigation headings
-    if (/^(on this page|navigation|table of contents|menu|footer|related)$/i.test(headingText)) {
-      continue;
-    }
+        edges.push({
+          source: rootDocNodeId,
+          target: sectionId,
+          relation: "defines",
+          provenance: "EXTRACTED",
+        });
+      }
 
-    const cleanSummary = stripTags(sectionBody)
-      .replace(/\s+/g, " ")
-      .slice(0, 500);
-
-    const sectionSlug = encodeURIComponent(headingText.toLowerCase().replace(/[^a-z0-9]+/g, "-"));
-    const sectionNodeId = `${docNodeId}#${sectionSlug}`;
-
-    if (!seenSections.has(sectionNodeId)) {
-      seenSections.add(sectionNodeId);
-
-      nodes.push({
-        id: sectionNodeId,
-        name: headingText,
-        kind: "concept",
-        path: sourcePath,
-        summary: cleanSummary || `Section details for ${headingText}`,
-        metadata: { parentDoc: docNodeId },
-      });
-
-      edges.push({
-        source: docNodeId,
-        target: sectionNodeId,
-        relation: "defines",
-        provenance: "EXTRACTED",
-        description: `Defines concept and section: ${headingText}`,
-      });
+      currentSection = {
+        name: headerMatch[2].trim(),
+        start: i + 1,
+      };
     }
   }
 
-  // Extract API Symbols and Code Constructs
-  const codeRegex = /<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>|```(?:[a-z]*\n)?([\s\S]*?)```/gi;
-  let codeMatch: RegExpExecArray | null;
-  const seenSymbols = new Set<string>();
+  // Finalize last section
+  if (currentSection) {
+    const sectionSlug = encodeURIComponent(currentSection.name.toLowerCase().replace(/[^a-z0-9]+/g, "-"));
+    const sectionId = `${rootDocNodeId}#${sectionSlug}`;
+    const sectionText = lines.slice(currentSection.start - 1).join(" ").slice(0, 400);
 
-  while ((codeMatch = codeRegex.exec(cleaned)) !== null) {
-    const codeSnippet = codeMatch[1] || codeMatch[2];
-    if (!codeSnippet) continue;
+    nodes.push({
+      id: sectionId,
+      name: currentSection.name,
+      kind: "concept",
+      path: relativeVaultPath,
+      sourceUrl: urlStr,
+      summary: sectionText,
+      lineStart: currentSection.start,
+      lineEnd: lines.length,
+    });
 
-    // Match symbol declarations (functions, methods, registers, tools, hooks)
-    const identifierMatches = codeSnippet.match(/\b(registerTool|registerCommand|on|execute|handle|[A-Za-z0-9_]{3,30})\b/g) || [];
-
-    for (const ident of identifierMatches) {
-      if (
-        ident.length >= 4 &&
-        !["const", "function", "return", "import", "export", "class", "async", "await"].includes(ident)
-      ) {
-        if (!seenSymbols.has(ident)) {
-          seenSymbols.add(ident);
-          const symbolNodeId = `api://${ident}`;
-
-          nodes.push({
-            id: symbolNodeId,
-            name: ident,
-            kind: "api",
-            path: sourcePath,
-            summary: `API symbol extracted from ${title}: ${ident}`,
-          });
-
-          edges.push({
-            source: docNodeId,
-            target: symbolNodeId,
-            relation: "references",
-            provenance: "EXTRACTED",
-          });
-        }
-      }
-    }
+    edges.push({
+      source: rootDocNodeId,
+      target: sectionId,
+      relation: "defines",
+      provenance: "EXTRACTED",
+    });
   }
 
   return {
     nodes,
     edges,
-    title,
-    summary: docSummary,
+    title: pageTitle,
+    summary: `Saved document to ${relativeVaultPath} and indexed ${nodes.length} sections.`,
+    savedPath: relativeVaultPath,
+  };
+}
+
+export async function ingestLocalFileToVault(filePath: string, workspaceRoot: string): Promise<IngestionResult> {
+  const absPath = join(workspaceRoot, filePath);
+  if (!existsSync(absPath)) {
+    throw new Error(`File not found: ${filePath}`);
+  }
+
+  const content = readFileSync(absPath, "utf-8");
+  const relPath = relative(workspaceRoot, absPath);
+  const lines = content.split("\n");
+
+  const nodes: GraphNode[] = [{
+    id: `file://${relPath}`,
+    name: relPath,
+    kind: "file",
+    path: relPath,
+    summary: lines.slice(0, 5).join(" ").slice(0, 200),
+    lineStart: 1,
+    lineEnd: lines.length,
+  }];
+
+  return {
+    nodes,
+    edges: [],
+    title: relPath,
+    summary: `Indexed local file ${relPath}`,
+    savedPath: relPath,
   };
 }
